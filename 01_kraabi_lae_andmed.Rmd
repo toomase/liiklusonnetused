@@ -158,7 +158,8 @@ Kaubanduskeskuste andmed kokku
 ```{r}
 kaubanduskeskused <- kaubanduskeskused_toodeldud %>% 
   left_join(kaubanduskeskused_lat_lon, by = c("url" = "x")) %>% 
-  select(nimi, url, lat, lon)
+  select(nimi, url, lat, lon) %>% 
+  distinct(lat, lon, .keep_all = TRUE)  # ainult unikaalsed aadressid
 ```
 
 Muuda kaubanduskeskuste andmed sf formaati
@@ -218,6 +219,6 @@ Leia kõigi kaupluste täpsed koordinaadid
 
 Salvesta liiklusõnnetuste töödeldud andmed ning kauplust/kaubanduskeskuste andmed koos koordinaatidega
 ```{r}
-save(kaubanduskeskused_sf, kaubanduskeskused, liiklusonnestused, liiklusonnestused_sf,
+save(kaubanduskeskused, liiklusonnestused, liiklusonnestused_sf,
      file = "data/liiklusonnetused_kaubanduskeskused.RData")
 ```
