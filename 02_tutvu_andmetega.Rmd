@@ -1,0 +1,164 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(mapview)
+library(sf)
+library(sp)
+library(rvest)
+library(stringr)
+library(ggmap)
+library(skimr)
+library(dbscan)
+library(leaflet)
+
+load("data/liiklusonnetused_kauplused.RData")
+```
+
+Tutvu kaupluste andmetega
+```{r}
+glimpse(kauplused_koordinaatidega)
+```
+
+Tutvu liiklusõnnetuste andmetega
+```{r}
+skim(liiklusonnestused)
+```
+
+
+Töötle kaupluste andmeid selliselt, et alles jäävad ainult täpse koordinaadi saanud poed
+```{r}
+kauplused <- kauplused_koordinaatidega %>% 
+  filter(loctype == "rooftop") %>% 
+  arrange(lon, lat, desc(kaubanduskeskus)) %>% 
+  distinct(lon, lat, .keep_all = TRUE) %>% 
+  select(-type, -loctype, -north:-west) %>% 
+  filter(kaubanduskeskus == 1)
+```
+
+Kaupluste andmed sf formaati, et need kaardile kanda
+```{r}
+# Eesti projektsiooni kirjeldus, mis on vajalik andmete kaardile kandmiseks
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+kauplused_sf <- kauplused %>% 
+  # muuda sf objektiks nii, et veerud lon ja lat on koordinaatidega
+  # crs väärtus 4326 annab õige projektsiooni
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  # muuda eesti projektsiooni, et arvutused õigesti teha
+  st_transform(eesti_proj4)
+  
+# kanna näidis andmed kaardile
+kauplused_sf %>% 
+  mapview()
+```
+
+Iga kaubanduskeskuse ümber 200m diameetriga buffer.
+Kasutan seda selleks, et tuvastada kaubanduskeskuse juures toimunud liiklusõnnetused.
+```{r}
+kaubanduskeskuse_buffer <- kauplused_sf %>% 
+  st_buffer(dist = 250) 
+# 
+# kaubanduskeskuse_buffer %>%
+#   mapview()
+```
+
+Ainult parkimise ja tagurdamisega seotud liiklusõnnetused
+```{r}
+liiklusonnestused_sf_parkimine <- liiklusonnestused_sf %>% 
+  filter(str_detect(situatsiooni_tyyp, "parkim|tagurd"))
+
+liiklusonnetused_parkimine <- liiklusonnestused %>% 
+  filter(str_detect(situatsiooni_tyyp, "parkim|tagurd"))
+```
+
+
+
+Leia kõik õnnetused, mis on toimunud kaubanduskeskuste 200m diameetri sees.
+Lisa igale vastavale liiklusõnnetusele kaubanduskeskuse nimi eraldi veeruna.
+```{r}
+kaubanduskeskuste_liiklusonnetused <- st_join(kaubanduskeskuse_buffer, 
+                                              liiklusonnestused_sf_parkimine) %>%
+  distinct(juhtumi_nr, nimi)
+
+onnetused_poega <- liiklusonnetused_parkimine %>% 
+  inner_join(kaubanduskeskuste_liiklusonnetused)
+
+onnetused_poega %>% 
+  tabyl(nimi) %>% 
+  arrange(desc(n))
+```
+
+Funktsioon, mis leiab iga kaubanduskeskuse piirkonnas toimunud avariide klastrid.
+```{r}
+klasterda_parkimised <- function(kaubanduskeskus){
+  
+  test <- onnetused_poega %>% 
+    filter(nimi == kaubanduskeskus)
+  
+  clusters <- hdbscan(test %>% 
+                      select(lat, lon), minPts = 5)
+  
+  liiklusonnetused_klastriga <- test %>%
+    mutate(cluster = clusters$cluster)
+  
+  return(liiklusonnetused_klastriga)
+}
+```
+
+Leia kõigi kaubanduskeskuste piirkonnas toimunud parkimiste/tagurdamiste klastrid
+```{r}
+kaubanduskeskused <- onnetused_poega %>% 
+  distinct(nimi) %>% 
+  pull(nimi)
+
+onnetused_klastritega <- map_df(kaubanduskeskused, possibly(klasterda_parkimised, NULL))
+```
+
+
+```{r}
+top_klaster <- onnetused_klastritega %>% 
+  filter(cluster != 0) %>% 
+  group_by(nimi, cluster) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  group_by(nimi) %>% 
+  filter(n == max(n))
+```
+
+```{r}
+top_klaster %>% 
+  distinct(nimi, n) %>% 
+  arrange(desc(n))
+```
+
+
+
+Kanna tulemused kaardile
+Alles võiks jätta ainult need kaubanduskekused, kus on kuni 4 klastrit leitud. Muidu on tegemist kesklinnaga, kus moodustub palju klastreid ja pilt on väga ebaselge.
+Võib proovida tuvastada ka kaubanduskeskuste katastriüksused ja siis pärida ainult nende alale jäävad liiklusõnnetused.
+```{r}
+liiklusonnetused_klastriga <- onnetused_klastritega %>% 
+  filter(nimi == "Port Artur 2 Pärnus",
+         cluster != 0)
+
+cols <- colorFactor(topo.colors(10), liiklusonnetused_klastriga$cluster)
+
+pood <- kauplused %>% 
+  filter(nimi %in% (top_klaster %>% 
+           distinct(nimi) %>% 
+           pull(nimi)))
+
+leaflet(top_klaster) %>% 
+  addTiles() %>%
+  addCircleMarkers(
+    popup = ~as.character(cluster)) %>% 
+  addCircleMarkers(pood$lon, pood$lat, color = "red")
+```
+
+
+

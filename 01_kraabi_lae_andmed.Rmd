@@ -1,0 +1,223 @@
+---
+title: "Lae ja töötle liilusõnnetuste andmeid"
+output: html_notebook
+---
+
+Lae Eesti liiklusõnnetuste andmed perioodi 2013-2016 kohta
+Andmed on pärit siit: https://github.com/OpenGovIntelligence/EstonianRealEstatePilot/blob/master/applicationDevelopment/datasets/crashDataCleanedFixed.RDS
+Algandmed pärinevad LKF-lt: https://drive.google.com/open?id=0B-uo-u1vqujbZWhtYi1jbU1OZE0
+
+Lisaks kraabi 1182.ee lehelt Eesti kaubanduskeskuste koordinaadid, et nende põhjal edasises analüüsis tuvastada liiklusõnnetused (parkimisega seotud), mis on toimunud kaubanduskeskuste juures.
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(mapview)
+library(sf)
+library(sp)
+library(rvest)
+library(stringr)
+
+liiklusonnestused_raw <- read_rds("data/crashDataCleanedFixed.RDS") 
+
+# Kuna veerupealkirjad on vales kodeeringus, siis muuda need ära
+pealkirjad <- c("lon", "lat", "juhtumi_nr", "kuupaev", "kell", "situatsiooni_tyyp",
+  "kahju_liik", "kahju_suurus_eur", "y_koordinaat", "x_koordinaat")
+
+colnames(liiklusonnestused_raw) <- pealkirjad
+
+# Paranda kodeering
+liiklusonnestused <- liiklusonnestused_raw %>% 
+  mutate_all(repair_encoding, from = "ISO-8859-1") %>% 
+  mutate_at(vars(lon, lat, kahju_suurus_eur), funs(as.numeric(.))) %>% 
+  select(-x_koordinaat, -y_koordinaat)
+```
+
+
+# Liiklusõnnetused
+
+Tutvu andmetega
+```{r}
+glimpse(liiklusonnestused)
+```
+
+Muuda liiklusõnnetuste data frame sf objektiks, et sellega geo analüüsi teha
+```{r}
+liiklusonnestused_sf <- liiklusonnestused %>% 
+  # muuda sf objektiks nii, et veerud lon ja lat on koordinaatidega
+  # crs väärtus 4326 annab õige projektsiooni
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# kanna näidis andmed kaardile
+liiklusonnestused_sf %>% 
+  sample_n(500) %>% 
+  mapview()
+```
+
+
+Muuda objekt sf-ks, et seda liiklusõnnetusi kaardile kanda 
+Vana konvertimis eviis, mis kasutas sp paketti
+```{r}
+# # Eesti projektsiooni kirjeldus, mis on vajalik andmete kaardile kandmiseks
+# eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+# 
+# liiklusonnestused_sf <- liiklusonnestused
+# 
+# # lisa eraldi koordinaatide veerg, et saaks teha spatialpointsdataframe objekti
+# coordinates(liiklusonnestused_sf) <- ~ lon + lat
+# 
+# # anna projektsioon
+# proj4string(liiklusonnestused_sf) <- CRS("+proj=longlat")
+# 
+# # muuda projektsioon samaks, mis majade polügoni tabelil
+# # tee sellest sf objekt
+# liiklusonnestused_sf <- spTransform(liiklusonnestused_sf, eesti_proj4) %>% 
+#   st_as_sf()
+# 
+# mapview(liiklusonnestused_sf %>% sample_n(5000))
+```
+
+Kui palju on parkimise ja tagurdamisega seotud liiklusõnnetusi?
+```{r}
+liiklusonnestused_sf %>% 
+  filter(str_detect(str_to_lower(situatsiooni_tyyp), "parkim|tagur")) %>%
+  tabyl(situatsiooni_tyyp, sort = TRUE)
+```
+
+# Kaubanduskeskused
+
+Analüüsi, kui palju liiklusõnnetusi (parkimisega seoses) toimub kaubanduskeskuste parklates.
+
+Kraabi 1182 lehelt Eesti kaubanduskeskused koos aadressidega ning kõik Eesti Kauplused aadressidega.
+
+Funktsioon, mis kraabib kaubanduskeskuste nimed ja 1182.ee lingid
+```{r}
+kaubanduskeskuste_lingid <- function(x){
+  leht <- read_html(x)
+  
+  url <- leht %>% 
+    html_nodes(".company-profile-link") %>% 
+    html_attr("href")
+  
+  nimi <- leht %>% 
+    html_nodes(".company-profile-link") %>% 
+    html_text()
+  
+  kaubanduskeskus_lingiga <- data_frame(url, nimi)
+}
+```
+
+Kraabi kaubanduskeskuste nimed ja lingid
+```{r}
+# andmed on kokku 14-l lehel
+# genereeri kõik url-d
+kaubanduskeskused_url <- str_c("https://www.1182.ee/kaubanduskeskused/",
+                               seq(1, 14, 1))
+
+kaubanduskeskused_raw <- map_df(kaubanduskeskused_url, possibly(kaubanduskeskuste_lingid, otherwise = NULL))
+```
+
+Töötle kaubanduskeskuste linke
+```{r}
+kaubanduskeskused_toodeldud <- kaubanduskeskused_raw %>% 
+  mutate(url = str_c("https://www.1182.ee", url, sep = ""))
+
+kaubanduskeskused_lingid <- kaubanduskeskused_toodeldud %>% 
+  pull(url)
+```
+
+Funktsioon, mis kraabib kaubanduskeskuse lat/lon koordinaadid
+```{r}
+kaubanduskeskuse_lat_lon <- function(x){
+  Sys.sleep(1)
+  
+  leht <- read_html(x)
+  
+  lat_lon <- leht %>% 
+    html_nodes("script") %>% 
+    html_text() %>% 
+    as_data_frame() %>% 
+    filter(str_detect(value, "LatLng")) %>% 
+    mutate(coord = str_extract(value, "(?<=LatLng\\().*?(?=\\))"),
+           coord = str_replace_all(coord, ",", ""),
+           lat = as.numeric(word(coord, 1)),
+           lon = as.numeric(word(coord, 2))) %>% 
+    select(lat, lon) %>% 
+    add_column(x)
+}
+```
+
+Kraabi kaubanduskeskuste lat/lon koordinaadid
+```{r}
+kaubanduskeskused_lat_lon <- map_df(kaubanduskeskused_lingid,
+                                    possibly(kaubanduskeskuse_lat_lon, 
+                                             otherwise = NULL))
+```
+
+Kaubanduskeskuste andmed kokku
+```{r}
+kaubanduskeskused <- kaubanduskeskused_toodeldud %>% 
+  left_join(kaubanduskeskused_lat_lon, by = c("url" = "x")) %>% 
+  select(nimi, url, lat, lon)
+```
+
+Muuda kaubanduskeskuste andmed sf formaati
+```{r}
+kaubanduskeskused_sf <- kaubanduskeskused %>% 
+  # muuda sf objektiks nii, et veerud lon ja lat on koordinaatidega
+  # crs väärtus 4326 annab õige projektsiooni
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# kanna andmed kaardile
+kaubanduskeskused_sf %>% 
+  mapview()
+```
+
+
+Kustuta korduva aadressiga kauplused/kaubanduskeskused
+Primaarsena jäta samal aadressil alles kaubanduskeskus
+Esialgu kraapisin ainult aadressid tekstina ja geokodeerimisega leidsin koordinaadid
+```{r}
+# kauplus_kaubanduskeskus <- kaubanduskeskused %>% 
+#   mutate(kaubanduskeskus = 1) %>% 
+#   bind_rows(kauplused %>% 
+#               mutate(kaubanduskeskus = 0)) %>% 
+#   arrange(aadress, desc(kaubanduskeskus), nimi) %>% 
+#   filter( aadress != "") %>% 
+#   distinct(aadress, .keep_all = TRUE) %>% 
+#   mutate(
+#     # aadressi töötlemine
+#     # eraldi aadressist postiindeksid (need on algandmetes koos maja numbriga)  
+#     # kõik 5-kohalised numbrid loen postiindeksiks
+#     numbrid_aadressis = str_extract(aadress, "[0-9]{5,}"),
+#     postiindeks = str_sub(numbrid_aadressis, start = -5),
+#     # kustuta aadressist postiindeksid
+#     aadress_toodeldud = str_replace(aadress, postiindeks, ""),
+#     # kustuta aadressist sulgudes olev tekst
+#     aadress_toodeldud = str_replace_all(aadress_toodeldud, "\\(.*\\)", ""),
+#     aadress_toodeldud = ifelse(is.na(aadress_toodeldud), aadress, aadress_toodeldud),
+#     korteri_nr = str_extract(aadress_toodeldud, "-[0-9]{1,}"),
+#     aadress_toodeldud = ifelse(is.na(korteri_nr), aadress_toodeldud,
+#                                str_replace_all(aadress_toodeldud, korteri_nr, ""))) %>% 
+#   arrange(aadress_toodeldud, kaubanduskeskus, nimi) %>% 
+#   distinct(aadress_toodeldud, .keep_all = TRUE) %>% 
+#   select(nimi, aadress = aadress_toodeldud, kaubanduskeskus)
+```
+
+Leia kõigi kaupluste täpsed koordinaadid
+```{r}
+# # google maps API abil kaupluste aadresside geokodeerimine
+# koordinaadid <- geocode(kauplus_kaubanduskeskus$aadress, "more") 
+# 
+# # kauplused koos asukoha koordinaatidega
+# kauplused_koordinaatidega <- kauplus_kaubanduskeskus %>%
+#     bind_cols(koordinaadid) %>%
+#     # välista need, mille koordinaate ei saanud tuvastada
+#     filter(!is.na(lon))
+```
+
+Salvesta liiklusõnnetuste töödeldud andmed ning kauplust/kaubanduskeskuste andmed koos koordinaatidega
+```{r}
+save(kaubanduskeskused_sf, kaubanduskeskused, liiklusonnestused, liiklusonnestused_sf,
+     file = "data/liiklusonnetused_kaubanduskeskused.RData")
+```
