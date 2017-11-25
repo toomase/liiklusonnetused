@@ -15,6 +15,10 @@ library(ggmap)
 library(skimr)
 library(dbscan)
 library(leaflet)
+library(lubridate)
+library(dygraphs)
+library(xts)
+library(padr)
 
 load("data/liiklusonnetused_kaubanduskeskused.RData")
 ```
@@ -42,7 +46,22 @@ kaubanduskeskused_sf %>%
   mapview()
 ```
 
-Iga kaubanduskeskuse ümber 200m diameetriga buffer.
+```{r}
+liiklusonnestused_sf <- liiklusonnestused %>% 
+  # muuda sf objektiks nii, et veerud lon ja lat on koordinaatidega
+  # crs väärtus 4326 annab õige projektsiooni
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE) %>% 
+  # muuda eesti projektsiooni, et arvutused õigesti teha
+  st_transform(eesti_proj4)
+  
+# kanna näidis andmed kaardile
+liiklusonnestused_sf %>%
+  head(500) %>% 
+  mapview()
+```
+
+
+Iga kaubanduskeskuse ümber 250m diameetriga buffer.
 Kasutan seda selleks, et tuvastada kaubanduskeskuse juures toimunud liiklusõnnetused.
 ```{r}
 kaubanduskeskuse_buffer <- kaubanduskeskused_sf %>% 
@@ -64,7 +83,7 @@ liiklusonnetused_parkimine <- liiklusonnestused %>%
 
 
 
-Leia kõik õnnetused, mis on toimunud kaubanduskeskuste 200m diameetri sees.
+Leia kõik õnnetused, mis on toimunud kaubanduskeskuste 250m diameetri sees.
 Lisa igale vastavale liiklusõnnetusele kaubanduskeskuse nimi eraldi veeruna.
 ```{r}
 kaubanduskeskuste_liiklusonnetused <- st_join(kaubanduskeskuse_buffer, 
@@ -83,13 +102,13 @@ Funktsioon, mis leiab iga kaubanduskeskuse piirkonnas toimunud avariide klastrid
 ```{r}
 klasterda_parkimised <- function(kaubanduskeskus){
   
-  test <- onnetused_poega %>% 
+  df <- onnetused_poega %>% 
     filter(nimi == kaubanduskeskus)
   
-  clusters <- hdbscan(test %>% 
-                      select(lat, lon), minPts = 5)
+  clusters <- hdbscan(df %>% 
+                      select(lat, lon), minPts = 8)
   
-  liiklusonnetused_klastriga <- test %>%
+  liiklusonnetused_klastriga <- df %>%
     mutate(cluster = clusters$cluster)
   
   return(liiklusonnetused_klastriga)
@@ -98,14 +117,16 @@ klasterda_parkimised <- function(kaubanduskeskus){
 
 Leia kõigi kaubanduskeskuste piirkonnas toimunud parkimiste/tagurdamiste klastrid
 ```{r}
-kaubanduskeskused <- onnetused_poega %>% 
+kaubanduskeskused_vector <- onnetused_poega %>% 
   distinct(nimi) %>% 
   pull(nimi)
 
-onnetused_klastritega <- map_df(kaubanduskeskused, possibly(klasterda_parkimised, NULL))
+onnetused_klastritega <- map_df(kaubanduskeskused_vector, 
+                                possibly(klasterda_parkimised, NULL))
 ```
 
-
+Leia igale kaubanduskeskusele kõige suurema õnnetuste arvuga klaster.
+Seda kasutan kaubanduskeskuste juures toimunud õnnetuste tunnusena.
 ```{r}
 top_klaster <- onnetused_klastritega %>% 
   filter(cluster != 0) %>% 
@@ -113,9 +134,12 @@ top_klaster <- onnetused_klastritega %>%
   mutate(n = n()) %>% 
   ungroup() %>% 
   group_by(nimi) %>% 
-  filter(n == max(n))
+  filter(n == max(n),  # ainult kõige suurem klaster jääb alles
+         n_distinct(cluster) < 5)  # ainult need, kaubanduskeskused, kus on alla 5 klastri
+                                   # sellega välistan osa kesklinna kaubanduskeskusi
 ```
 
+Järjesta kaubanduskeskused liiklusõnnetuste arvu järgi
 ```{r}
 top_klaster %>% 
   distinct(nimi, n) %>% 
@@ -125,20 +149,15 @@ top_klaster %>%
 
 
 Kanna tulemused kaardile
-Alles võiks jätta ainult need kaubanduskekused, kus on kuni 4 klastrit leitud. Muidu on tegemist kesklinnaga, kus moodustub palju klastreid ja pilt on väga ebaselge.
-Võib proovida tuvastada ka kaubanduskeskuste katastriüksused ja siis pärida ainult nende alale jäävad liiklusõnnetused.
+
 ```{r}
-liiklusonnetused_klastriga <- onnetused_klastritega %>% 
-  filter(nimi == "Port Artur 2 Pärnus",
-         cluster != 0)
-
-cols <- colorFactor(topo.colors(10), liiklusonnetused_klastriga$cluster)
-
-pood <- kauplused %>% 
+# Ainult nende kaubanduskeskuste koordinaadid, mis eelnevas analüüsis välja valisin
+pood <- kaubanduskeskused %>% 
   filter(nimi %in% (top_klaster %>% 
            distinct(nimi) %>% 
            pull(nimi)))
 
+# Kanna kaardile kaubanduskeskused ja nende juures toimunud õnnetused
 leaflet(top_klaster) %>% 
   addTiles() %>%
   addCircleMarkers(
@@ -146,5 +165,108 @@ leaflet(top_klaster) %>%
   addCircleMarkers(pood$lon, pood$lat, color = "red")
 ```
 
+## Analüüsi kaubanduskeskuste juures toimunud õnnetusi
+
+Kuna kuupäevad on algandmetes teksti formaadis, siis nende konvertimiseks date-time formaati on vaja eestikeelsed kuu nimed asendada inglise keelsetega. 
+Selleks tekita eraldi vastavauste tabel.
+```{r}
+kuu_est_eng <- tribble(
+  ~est, ~eng,
+  "juuli", "july",
+  "juuni", "june",
+  "mai", "may",
+  "aprill", "april",
+  "märts", "march",
+  "veebruar", "february",
+  "jaanuar", "january",
+  "detsember", "december",
+  "oktoober", "october"
+)
+```
+
+Puhasta andmetes kupäeva ja kellaja veerud.
+Ümarda eraldi veerus kuupäev nädala ja kuu täpsusega. Selle põhjal saab teha pisut üldisemad graafikud.
+```{r}
+top_klaster_kuupaevaga <- top_klaster %>% 
+  ungroup() %>% 
+  select(-cluster, -n) %>% 
+  # leia kuu nimi, et selle järgi siduda ja asendada inglisekeelne nimetus
+  mutate(kuu = str_extract(kuupaev, "(?<=\\. )[[:alpha:]]*")) %>% 
+  left_join(kuu_est_eng, by = c("kuu" = "est")) %>% 
+  mutate(kuupaev_2 = str_replace(kuupaev, kuu, eng)) %>% 
+  mutate(kp = str_extract(coalesce(kuupaev_2, kuupaev), "(?<=, ).*"),
+         kp = dmy(kp),
+         aeg = hms(kell)) %>% 
+  select(-kuupaev_2, -eng, -kuu) %>% 
+  arrange(kp) %>% 
+  padr::thicken("week") %>%   # lisa kuupäeva veerg, mis on nädala täpsusega
+  padr::thicken(by = "kp", "month")  # lisa kuupäeva veerg, mis on kuu täpsusega
+
+top_klaster_kuupaevaga
+```
+
+Joonista interaktiivne graafik, mis näitab nädala täpsusega liiklusõnnetuste arvu.
+```{r}
+top_klaster_nadal <- top_klaster_kuupaevaga %>% 
+  count(kp_week)
+
+# time series objekt
+top_klaster_nadal_ts <- xts(x = top_klaster_nadal, 
+                            order.by = top_klaster_nadal$kp_week)
+
+dygraph(top_klaster_nadal_ts) %>% 
+  dyRangeSelector()
+```
+
+Joonista interaktiivne graafik, mis näitab nädala täpsusega liiklusõnnetuste arvu.
+```{r}
+top_klaster_kuu <- top_klaster_kuupaevaga %>% 
+  count(kp_month)
+
+# time series objekt
+top_klaster_kuu_ts <- xts(x = top_klaster_kuu, 
+                            order.by = top_klaster_kuu$kp_month)
+
+dygraph(top_klaster_kuu_ts) %>% 
+  dyRangeSelector()
+```
+
+Tundide lõikes liiklusõõnetuste arv kaubanduskeskuste juures
+```{r}
+top_klaster_kuupaevaga %>% 
+  mutate(tund = hour(aeg)) %>% 
+  ggplot(aes(tund)) +
+  geom_bar()
+```
 
 
+Töötle kõiki parimisega seotud liiklusõnnetusi nii, et saaks lisada kuupäeva ja kellaaja
+```{r}
+parkimine_kuupaevaga <- liiklusonnestused %>% 
+  filter(str_detect(situatsiooni_tyyp, "parkim|tagurd")) %>% 
+  ungroup() %>% 
+  # leia kuu nimi, et selle järgi siduda ja asendada inglisekeelne nimetus
+  mutate(kuu = str_extract(kuupaev, "(?<=\\. )[[:alpha:]]*")) %>% 
+  left_join(kuu_est_eng, by = c("kuu" = "est")) %>% 
+  mutate(kuupaev_2 = str_replace(kuupaev, kuu, eng)) %>% 
+  mutate(kp = str_extract(coalesce(kuupaev_2, kuupaev), "(?<=, ).*"),
+         kp = dmy(kp),
+         aeg = hms(kell)) %>% 
+  select(-kuupaev_2, -eng, -kuu) %>% 
+  arrange(kp) %>% 
+  padr::thicken("week") %>%   # lisa kuupäeva veerg, mis on nädala täpsusega
+  padr::thicken(by = "kp", "month")  # lisa kuupäeva veerg, mis on kuu täpsusega
+```
+
+Joonista kõigi parkimisega seotud õnnetuste kohta interaktiivne graafik, mis näitab nädala täpsusega liiklusõnnetuste arvu.
+```{r}
+parkimine_nadal <- parkimine_kuupaevaga %>% 
+  count(kp_week)
+
+# time series objekt
+parkimine_nadal_ts <- xts(x = parkimine_nadal, 
+                            order.by = parkimine_nadal$kp_week)
+
+dygraph(parkimine_nadal_ts) %>% 
+  dyRangeSelector()
+```
